@@ -635,6 +635,14 @@ const MIGRATIONS = [
       );
     `);
   },
+  // v10 — Economy command cooldowns.
+  (database) => {
+    database.exec(`
+      ALTER TABLE economy_accounts ADD COLUMN daily_at INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE economy_accounts ADD COLUMN work_at INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE economy_accounts ADD COLUMN crime_at INTEGER NOT NULL DEFAULT 0;
+    `);
+  },
 ];
 
 function migrate(database, migrations = MIGRATIONS) {
