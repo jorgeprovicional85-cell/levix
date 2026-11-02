@@ -359,16 +359,102 @@ function deleteQrCode() {
 // --- LID <-> phone number (Baileys v7) ---
 // ===================================================================
 
+
 function storeLidPnMapping(lid, pn, deviceIndex = 0) {
-  q(
-    `INSERT INTO lid_mapping (lid, pn, device_index, updated_at) VALUES (?, ?, ?, ?)
-     ON CONFLICT(lid) DO UPDATE SET
-       pn = excluded.pn,
-       device_index = excluded.device_index,
-       updated_at = excluded.updated_at`,
-  ).run(lid, pn, deviceIndex, Date.now());
-  logger.debug(`[LID] Stored mapping: ${lid} <-> ${pn}`);
+  const normalizedLid = normalizeJid(String(lid || ""));
+  const normalizedPn = normalizeJid(String(pn || ""));
+
+  if (
+    !normalizedLid ||
+    !normalizedPn ||
+    !normalizedLid.endsWith("@lid") ||
+    !normalizedPn.endsWith("@s.whatsapp.net")
+  ) {
+    logger.debug("[LID] Invalid mapping ignored");
+    return;
+  }
+
+  return withImmediateTransaction(() => {
+    const existingMapping = q(
+      "SELECT pn FROM lid_mapping WHERE lid = ?"
+    ).get(normalizedLid);
+
+    if (
+      existingMapping?.pn &&
+      normalizeJid(existingMapping.pn) !== normalizedPn
+    ) {
+      logger.warn(`[LID] Conflicting mapping ignored for ${normalizedLid}`);
+      return;
+    }
+
+    q(`
+      INSERT INTO lid_mapping
+      (lid, pn, device_index, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(lid) DO UPDATE SET
+        pn = excluded.pn,
+        device_index = excluded.device_index,
+        updated_at = excluded.updated_at
+    `).run(normalizedLid, normalizedPn, deviceIndex, Date.now());
+
+    const lidAccount = q(`
+  SELECT user_jid, balance, created_at, updated_at,
+         daily_at, work_at, crime_at
+  FROM economy_accounts
+  WHERE user_jid = ?
+`).get(normalizedLid) || null;
+
+const pnAccount = q(`
+  SELECT user_jid, balance, created_at, updated_at,
+         daily_at, work_at, crime_at
+  FROM economy_accounts
+  WHERE user_jid = ?
+`).get(normalizedPn) || null;
+
+    if (lidAccount && pnAccount) {
+      const mergedBalance = lidAccount.balance + pnAccount.balance;
+
+      if (!Number.isSafeInteger(mergedBalance)) {
+        throw new Error("[Economy] Balance overflow during LID merge");
+      }
+
+      q(`
+        UPDATE economy_accounts
+        SET balance = ?,
+            created_at = MIN(created_at, ?),
+            updated_at = MAX(updated_at, ?),
+            daily_at = MAX(daily_at, ?),
+            work_at = MAX(work_at, ?),
+            crime_at = MAX(crime_at, ?)
+        WHERE user_jid = ?
+      `).run(
+        mergedBalance,
+        lidAccount.created_at,
+        lidAccount.updated_at,
+        lidAccount.daily_at,
+        lidAccount.work_at,
+        lidAccount.crime_at,
+        normalizedPn
+      );
+
+      q(`
+        DELETE FROM economy_accounts
+        WHERE user_jid = ?
+      `).run(normalizedLid);
+    } else if (lidAccount) {
+      q(`
+        UPDATE economy_accounts
+        SET user_jid = ?
+        WHERE user_jid = ?
+      `).run(normalizedPn, normalizedLid);
+    }
+
+    logger.debug(
+      `[LID] Stored mapping: ${normalizedLid} <-> ${normalizedPn}`
+    );
+  });
 }
+
 
 function storeLidPnMappings(mappings) {
   if (!mappings?.length) return;
@@ -1832,6 +1918,114 @@ function clearAutoDeleteOnUnlink() {
   q("UPDATE auto_delete_rules SET deleted_count = 0, last_deleted_at = NULL").run();
   invalidateAutoDeleteRuleCache();
 }
+// Global virtual economy
+function economyCanonicalJid(identifier) {
+  if (!identifier) return null;
+
+  const jid = normalizeJid(String(identifier));
+
+  if (isLidJid(jid)) {
+    const pn = getPnForLid(jid);
+    return pn ? normalizeJid(pn) : jid;
+  }
+
+  return jid;
+}
+
+function economyGetAccount(identifier) {
+  const jid = economyCanonicalJid(identifier);
+  if (!jid) return null;
+
+  return q(`
+    SELECT user_jid, balance, created_at, updated_at,
+           daily_at, work_at, crime_at
+    FROM economy_accounts
+    WHERE user_jid = ?
+  `).get(jid) || null;
+}
+
+function economyRegister(identifier) {
+  const jid = economyCanonicalJid(identifier);
+  if (!jid) return { ok: false, reason: "invalid_user" };
+
+  const now = Date.now();
+
+  const result = q(`
+    INSERT OR IGNORE INTO economy_accounts
+    (user_jid, balance, created_at, updated_at)
+    VALUES (?, 500, ?, ?)
+  `).run(jid, now, now);
+
+  return {
+    ok: result.changes > 0,
+    account: economyGetAccount(jid)
+  };
+}
+
+function economyTransfer(from, to, amount) {
+  const sender = economyCanonicalJid(from);
+  const receiver = economyCanonicalJid(to);
+
+  if (!sender || !receiver) {
+    return { ok: false, reason: "invalid_user" };
+  }
+
+  if (sender === receiver) {
+    return { ok: false, reason: "self_transfer" };
+  }
+
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    return { ok: false, reason: "invalid_amount" };
+  }
+
+  return withImmediateTransaction(() => {
+    const senderAccount = economyGetAccount(sender);
+    const receiverAccount = economyGetAccount(receiver);
+
+    if (!senderAccount || !receiverAccount) {
+      return { ok: false, reason: "account_not_found" };
+    }
+
+    if (senderAccount.balance < amount) {
+      return { ok: false, reason: "insufficient_funds" };
+    }
+
+    if (receiverAccount.balance + amount > Number.MAX_SAFE_INTEGER) {
+      return { ok: false, reason: "balance_limit" };
+    }
+
+    const now = Date.now();
+
+    q(`
+      UPDATE economy_accounts
+      SET balance = balance - ?, updated_at = ?
+      WHERE user_jid = ?
+    `).run(amount, now, sender);
+
+    q(`
+      UPDATE economy_accounts
+      SET balance = balance + ?, updated_at = ?
+      WHERE user_jid = ?
+    `).run(amount, now, receiver);
+
+    return {
+      ok: true,
+      sender: economyGetAccount(sender),
+      receiver: economyGetAccount(receiver)
+    };
+  });
+}
+
+function economyTop(limit = 10) {
+  const safeLimit = Math.max(1, Math.min(100, Math.floor(limit)));
+
+  return q(`
+    SELECT user_jid, balance
+    FROM economy_accounts
+    ORDER BY balance DESC
+    LIMIT ?
+  `).all(safeLimit);
+}
 
 module.exports = {
   // Lifecycle
@@ -1984,4 +2178,10 @@ module.exports = {
   capAutoDeleteLog,
   clearAutoDeleteOnUnlink,
   invalidateAutoDeleteRuleCache,
+    // Global virtual economy
+  economyCanonicalJid,
+  economyGetAccount,
+  economyRegister,
+  economyTransfer,
+  economyTop,
 };
