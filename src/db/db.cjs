@@ -619,6 +619,22 @@ const MIGRATIONS = [
       CREATE INDEX idx_auto_delete_log_rule ON auto_delete_log (rule_id, created_at);
     `);
   },
+  // v9 — Global virtual economy.
+  (database) => {
+    database.exec(`
+      CREATE TABLE economy_accounts (
+        user_jid TEXT PRIMARY KEY,
+        balance INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE economy_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `);
+  },
 ];
 
 function migrate(database, migrations = MIGRATIONS) {
